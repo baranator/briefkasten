@@ -61,32 +61,185 @@
 const uint8_t payloadBufferLength = 4;    // Adjust to fit max payload length
 enum POSTBOX_STATE {
   YOUVEGOTMAIL=1,
-  POSTPICKEDUP=0,
-  EMPTY=2
+  EMPTY=0,
+  FLAP_LEFT_OPEN=2
+};
+
+enum SYS_STATE {
+  READY,
+  NOT_READY,
+  WAIT_FOR_FRONT_OPEN,
+  NEW_MAIL,
+  EMPTIED
 };
 
 const gpio_num_t FRONT_PIN = GPIO_NUM_26, TOP_PIN=GPIO_NUM_25;
 RTC_DATA_ATTR bool top_opened; 
-RTC_DATA_ATTR bool front_opened;
+RTC_DATA_ATTR SYS_STATE state; 
+RTC_DATA_ATTR bool not_ready_sent; 
 static volatile POSTBOX_STATE pb_status;
 static volatile uint16_t counter_ = 0;
 
-void infinite_sleep(int secs=0){
+
+void initLmic(bit_t adrEnabled = 1,
+              dr_t abpDataRate = DefaultABPDataRate, 
+              s1_t abpTxPower = DefaultABPTxPower) 
+{
+    // ostime_t timestamp = os_getTime();
+
+    // Initialize LMIC runtime environment
+    os_init();
+    // Reset MAC state
+    LMIC_reset();
+
+    // Enable or disable ADR (data rate adaptation). 
+    // Should be turned off if the device is not stationary (mobile).
+    // 1 is on, 0 is off.
+    LMIC_setAdrMode(adrEnabled);
+
+    if (activationMode == ActivationMode::OTAA)
+    {
+        #if defined(CFG_us915) || defined(CFG_au915)
+            // NA-US and AU channels 0-71 are configured automatically
+            // but only one group of 8 should (a subband) should be active
+            // TTN recommends the second sub band, 1 in a zero based count.
+            // https://github.com/TheThingsNetwork/gateway-conf/blob/master/US-global_conf.json
+            LMIC_selectSubBand(1); 
+        #endif
+    }
+
+    // Relax LMIC timing if defined
+    #if defined(LMIC_CLOCK_ERROR_PPM)
+        uint32_t clockError = 0;
+        #if LMIC_CLOCK_ERROR_PPM > 0
+            #if defined(MCCI_LMIC) && LMIC_CLOCK_ERROR_PPM > 4000
+                // Allow clock error percentage to be > 0.4%
+                #define LMIC_ENABLE_arbitrary_clock_error 1
+            #endif    
+            clockError = (LMIC_CLOCK_ERROR_PPM / 100) * (MAX_CLOCK_ERROR / 100) / 100;
+            LMIC_setClockError(clockError);
+        #endif
+
+        #ifdef USE_SERIAL
+            serial.print(F("Clock Error:   "));
+            serial.print(LMIC_CLOCK_ERROR_PPM);
+            serial.print(" ppm (");
+            serial.print(clockError);
+            serial.println(")");            
+        #endif
+    #endif
+
+    #ifdef MCCI_LMIC
+        // Register a custom eventhandler and don't use default onEvent() to enable
+        // additional features (e.g. make EV_RXSTART available). User data pointer is omitted.
+        LMIC_registerEventCb(&onLmicEvent, nullptr);
+    #endif
+}
+
+
+boolean front_open(){
+    return digitalRead(FRONT_PIN) == HIGH;
+}
+
+boolean top_open(){
+    return digitalRead(TOP_PIN) == HIGH;
+}
+
+boolean both_closed(){
+    return !top_open() && !front_open();
+}
+
+boolean both_open(){
+    return top_open() && front_open();
+}
+
+void set_front_interrupt(boolean enable=true, boolean on_high=true){
+        if(!enable){
+            serial.println("disabling for front-trigger");
+            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
+        }else{
+            serial.print("enabling for front-trigger on: ");
+            serial.println(on_high?"high":"low");
+            rtc_gpio_pullup_dis(FRONT_PIN);
+            rtc_gpio_pulldown_en(FRONT_PIN);
+            esp_sleep_enable_ext1_wakeup((1<<FRONT_PIN), on_high?ESP_EXT1_WAKEUP_ANY_HIGH:ESP_EXT1_WAKEUP_ALL_LOW);
+        }
+}
+
+void set_top_interrupt(boolean enable=true, boolean on_high=true){
+        if(!enable){
+            serial.println("disabling for top-trigger");
+            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT0);
+        }else{
+            serial.print("enabling for top-trigger on: ");
+            serial.println(on_high?"high":"low");
+            rtc_gpio_pullup_dis(TOP_PIN);
+            rtc_gpio_pulldown_en(TOP_PIN);
+            esp_sleep_enable_ext0_wakeup(TOP_PIN, on_high?1:0);
+        }
+}
+
+void wait_and_sleep(long secs=0){
     //makes the uc sleep until for abitrary time, until someone opens a flap 
-    serial.println("going to infinite sleep");
-    //set Pulldowns and wait for a highlevel on the Pins specified
-    rtc_gpio_pullup_dis(TOP_PIN);
-    rtc_gpio_pulldown_en(TOP_PIN);
-    rtc_gpio_pullup_dis(FRONT_PIN);
-    rtc_gpio_pulldown_en(FRONT_PIN);
-    esp_sleep_enable_ext0_wakeup(TOP_PIN, 1);
-    esp_sleep_enable_ext1_wakeup((1<<FRONT_PIN), ESP_EXT1_WAKEUP_ANY_HIGH);
+    if(secs==0){
+        serial.println("going to infinite sleep");
+    }else{
+        serial.println("going to sleep of "+String(secs)+" seconds");
+    }
 
     if(secs!=0){
         esp_sleep_enable_timer_wakeup(secs * 1000000);
     }
+    serial.println("good night!");
     esp_deep_sleep_start();
 }
+
+
+void join_and_init(){
+    initLmic();
+    if (activationMode == ActivationMode::OTAA){
+        LMIC_startJoining();
+    }
+}
+
+
+void send_mail_emptied(){
+    pb_status = EMPTY;
+    join_and_init();
+}
+
+void send_new_mail(){
+    pb_status = YOUVEGOTMAIL;
+    join_and_init();
+}
+
+void send_flap_left_open(){
+    pb_status = FLAP_LEFT_OPEN;
+    join_and_init();
+}
+
+    void ready_or_not(){
+        if(both_closed()){
+            state=READY;
+            not_ready_sent=false;
+            set_front_interrupt();
+            set_top_interrupt();
+            wait_and_sleep();
+            
+        }else{
+            state = NOT_READY; 
+            if(not_ready_sent){
+                set_front_interrupt(true,false);
+                set_top_interrupt(true,false);
+                wait_and_sleep(60);
+            }else{
+                not_ready_sent=true;
+                send_flap_left_open();
+            }
+        }
+        
+    }
+
 //  █ █ █▀▀ █▀▀ █▀▄   █▀▀ █▀█ █▀▄ █▀▀   █▀▀ █▀█ █▀▄
 //  █ █ ▀▀█ █▀▀ █▀▄   █   █ █ █ █ █▀▀   █▀▀ █ █ █ █
 //  ▀▀▀ ▀▀▀ ▀▀▀ ▀ ▀   ▀▀▀ ▀▀▀ ▀▀  ▀▀▀   ▀▀▀ ▀ ▀ ▀▀ 
@@ -410,61 +563,6 @@ void printHeader(void)
     #endif
 }     
 
-void initLmic(bit_t adrEnabled = 1,
-              dr_t abpDataRate = DefaultABPDataRate, 
-              s1_t abpTxPower = DefaultABPTxPower) 
-{
-    // ostime_t timestamp = os_getTime();
-
-    // Initialize LMIC runtime environment
-    os_init();
-    // Reset MAC state
-    LMIC_reset();
-
-    // Enable or disable ADR (data rate adaptation). 
-    // Should be turned off if the device is not stationary (mobile).
-    // 1 is on, 0 is off.
-    LMIC_setAdrMode(adrEnabled);
-
-    if (activationMode == ActivationMode::OTAA)
-    {
-        #if defined(CFG_us915) || defined(CFG_au915)
-            // NA-US and AU channels 0-71 are configured automatically
-            // but only one group of 8 should (a subband) should be active
-            // TTN recommends the second sub band, 1 in a zero based count.
-            // https://github.com/TheThingsNetwork/gateway-conf/blob/master/US-global_conf.json
-            LMIC_selectSubBand(1); 
-        #endif
-    }
-
-    // Relax LMIC timing if defined
-    #if defined(LMIC_CLOCK_ERROR_PPM)
-        uint32_t clockError = 0;
-        #if LMIC_CLOCK_ERROR_PPM > 0
-            #if defined(MCCI_LMIC) && LMIC_CLOCK_ERROR_PPM > 4000
-                // Allow clock error percentage to be > 0.4%
-                #define LMIC_ENABLE_arbitrary_clock_error 1
-            #endif    
-            clockError = (LMIC_CLOCK_ERROR_PPM / 100) * (MAX_CLOCK_ERROR / 100) / 100;
-            LMIC_setClockError(clockError);
-        #endif
-
-        #ifdef USE_SERIAL
-            serial.print(F("Clock Error:   "));
-            serial.print(LMIC_CLOCK_ERROR_PPM);
-            serial.print(" ppm (");
-            serial.print(clockError);
-            serial.println(")");            
-        #endif
-    #endif
-
-    #ifdef MCCI_LMIC
-        // Register a custom eventhandler and don't use default onEvent() to enable
-        // additional features (e.g. make EV_RXSTART available). User data pointer is omitted.
-        LMIC_registerEventCb(&onLmicEvent, nullptr);
-    #endif
-}
-
 
 #ifdef MCCI_LMIC 
 void onLmicEvent(void *pUserData, ev_t ev)
@@ -519,10 +617,9 @@ void onEvent(ev_t ev)
             setTxIndicatorsOn(false);   
             printEvent(timestamp, ev);
             printFrameCounters();
+            
             //info was send, sleep till next opening of flaps
-            top_opened = false;
-            front_opened = false;
-            infinite_sleep();
+            ready_or_not();
 
             break;     
           
@@ -755,46 +852,54 @@ void setup()
     pinMode(FRONT_PIN, INPUT_PULLDOWN);
  
 
-    bool awakened_by_flap=false;
+    if(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1){
+        //FRONT WAS OPENED
+        if(state==READY){
+            state=EMPTIED;
+            send_mail_emptied();
+        }else if(state==WAIT_FOR_FRONT_OPEN){
+            state=EMPTIED;
+            send_mail_emptied();
+        }
+        ready_or_not();
+    }else if(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0){
+        //TOP WAS OPENED
+        if(state==READY){
+            if(front_open()){
+                state=EMPTIED;
+                send_mail_emptied();
+            }else{
+                state=WAIT_FOR_FRONT_OPEN;
+                set_front_interrupt();
+                wait_and_sleep(20);
+            }
+        }
+        ready_or_not();
+    }else if(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER){
+        //TIMEOUT
+        if(state==WAIT_FOR_FRONT_OPEN){
+            if(!front_open()){
+                state=NEW_MAIL;
+                send_new_mail();
+            }else{
+                state=EMPTIED;
+                send_mail_emptied();
+            }
+        }
+        ready_or_not();
 
-    if(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 || digitalRead(TOP_PIN)==HIGH){
-        top_opened = true;
-        awakened_by_flap = true;
-        serial.println("top: "+String(top_opened));
-    }
-
-    if(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1 || digitalRead(FRONT_PIN)==HIGH){
-        front_opened = true;
-        serial.println("front: "+String(front_opened));
-        awakened_by_flap = true;
-    }
-
-
-    if(awakened_by_flap){
-        //wait a few seconds for further openings to decide wether new post or emptying of box
-        serial.println("sleep and wait 20s for another flapaction");
-        
-        infinite_sleep(20);
-    }
-
-    serial.println("front: "+String(front_opened));
-    if(top_opened && !front_opened){
-        //Neue Post
-        pb_status = YOUVEGOTMAIL;
-    }else if(front_opened){
-        pb_status = POSTPICKEDUP;
     }else{
-        pb_status = EMPTY;
-        infinite_sleep();
+        //FIRST BOOT
+        ready_or_not();
     }
-    
-    serial.println("Flapaction processed, rdy to send msg: "+String(pb_status));
+
+
 
     initLmic();
 
-//  █ █ █▀▀ █▀▀ █▀▄   █▀▀ █▀█ █▀▄ █▀▀   █▀▄ █▀▀ █▀▀ ▀█▀ █▀█
-//  █ █ ▀▀█ █▀▀ █▀▄   █   █ █ █ █ █▀▀   █▀▄ █▀▀ █ █  █  █ █
-//  ▀▀▀ ▀▀▀ ▀▀▀ ▀ ▀   ▀▀▀ ▀▀▀ ▀▀  ▀▀▀   ▀▀  ▀▀▀ ▀▀▀ ▀▀▀ ▀ ▀
+    //  █ █ █▀▀ █▀▀ █▀▄   █▀▀ █▀█ █▀▄ █▀▀   █▀▄ █▀▀ █▀▀ ▀█▀ █▀█
+    //  █ █ ▀▀█ █▀▀ █▀▄   █   █ █ █ █ █▀▀   █▀▄ █▀▀ █ █  █  █ █
+    //  ▀▀▀ ▀▀▀ ▀▀▀ ▀ ▀   ▀▀▀ ▀▀▀ ▀▀  ▀▀▀   ▀▀  ▀▀▀ ▀▀▀ ▀▀▀ ▀ ▀
 
     // Place code for initializing sensors etc. here.
 
@@ -804,10 +909,7 @@ void setup()
 //  █ █ ▀▀█ █▀▀ █▀▄   █   █ █ █ █ █▀▀   █▀▀ █ █ █ █
 //  ▀▀▀ ▀▀▀ ▀▀▀ ▀ ▀   ▀▀▀ ▀▀▀ ▀▀  ▀▀▀   ▀▀▀ ▀ ▀ ▀▀ 
 
-    if (activationMode == ActivationMode::OTAA)
-    {
-        LMIC_startJoining();
-    }
+
 
     // Schedule initial doWork job for immediate execution.
     //os_setCallback(&doWorkJob, doWorkCallback);
